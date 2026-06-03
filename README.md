@@ -1,16 +1,18 @@
 # AI Assistant Security Hardening Guide
 
-A systematic walkthrough for hardening your agentic AI assistant's behavior on macOS. Written for **OpenClaw** and **Claude Code**, and adaptable to any agentic assistant that can run commands, touch files, and act on your behalf.
+A systematic walkthrough for hardening any agentic AI assistant that can run commands, touch files, and act on your behalf.
+
+This guide is **runtime-agnostic**. The concepts apply to any agentic assistant; the specifics differ by platform. Throughout the guide, OpenClaw and Claude Code are used as **concrete examples** because they're well-documented and behaviorally distinct — but the same patterns apply to LangChain agent loops, the Anthropic Agent SDK, OpenAI Assistants, custom MCP-host integrations, on-device frameworks, or anything else with comparable capabilities. If you're on a different runtime, read the body for the principle and the examples for the shape.
 
 This guide helps you think through security decisions — it doesn't prescribe specific settings.
 
 **Time required:** 1-2 hours for full walkthrough
-**Prerequisites:** A working agentic assistant (OpenClaw, Claude Code, or similar), basic familiarity with its capabilities
+**Prerequisites:** A working agentic assistant (any runtime), basic familiarity with its capabilities
 
 > **A note on terminology.** Throughout this guide:
-> - **Behavioral config** = the Markdown file your assistant reads to learn how to behave. It's `AGENTS.md` for OpenClaw and `CLAUDE.md` for Claude Code. The guide says "behavioral config" or "`AGENTS.md` / `CLAUDE.md`" interchangeably.
-> - **Platform config** = the assistant's own settings file. It's `~/.openclaw/openclaw.json` for OpenClaw and `~/.claude/settings.json` for Claude Code.
-> - **Platform layer** = the assistant's built-in enforcement (OpenClaw's exec approvals; Claude Code's permissions + hooks).
+> - **Behavioral config** = the file your assistant reads each turn to learn how to behave (markdown system prompt, behavior rules, etc.). Names vary by runtime: `AGENTS.md` (OpenClaw), `CLAUDE.md` (Claude Code), `system_prompt.md`, `instructions.md`, etc. The guide says "behavioral config" generically.
+> - **Platform config** = the assistant's runtime settings — usually JSON or YAML. Examples: `~/.openclaw/openclaw.json` (OpenClaw), `~/.claude/settings.json` (Claude Code). Whatever your runtime calls "the file where I configure tool permissions and security policies," that's it.
+> - **Platform layer** = the runtime's built-in enforcement — the gates that fire *regardless* of what the model decided. Examples: OpenClaw's exec approvals, Claude Code's permissions + hooks. Your runtime should have equivalent gating; if it doesn't, that's a red flag.
 
 ---
 
@@ -46,7 +48,7 @@ Your agentic AI assistant can:
 
 This power is useful — and exploitable. A malicious email, webpage, or file could contain instructions that hijack your assistant's behavior. This guide helps you build defenses.
 
-This is not an OpenClaw problem or a Claude Code problem — it's inherent to *any* assistant you give real capabilities. The mechanisms differ by platform; the threat model is shared.
+This is not a problem with any particular runtime — it's inherent to *any* assistant you give real capabilities. The mechanisms differ by platform; the threat model is shared.
 
 ---
 
@@ -69,71 +71,61 @@ Before hardening, understand what you're protecting against:
 
 ## Two-Layer Security Model
 
-This guide focuses on **assistant-enforced** guardrails — rules your assistant follows because you wrote them into its behavioral config (`AGENTS.md` / `CLAUDE.md`). But every serious agentic platform also has **platform-enforced** security: native gating that intercepts actions at the infrastructure level, below the model's discretion.
+This guide focuses on **assistant-enforced** guardrails — rules your assistant follows because you wrote them into its behavioral config. But every serious agentic platform also has **platform-enforced** security: native gating that intercepts actions at the infrastructure level, below the model's discretion.
 
 Neither layer is sufficient alone. Together, they cover each other's gaps. The behavioral layer knows *why* an action is happening; the platform layer enforces *regardless of why* — it still fires even if the model has been talked out of its own rules.
 
-### The Platform Layer — OpenClaw
+### The Platform Layer — Concept
 
-OpenClaw can require your approval before any shell command runs. When a command isn't on the allowlist, you see a prompt with the exact binary and arguments, and can:
-- **`allow-once`** — run this time only
-- **`allow-always`** — add the resolved binary path to the permanent allowlist
-- **`deny`** — block it
+A platform layer should give you, at minimum:
 
-Key properties:
-- **Per-agent allowlists** — Each agent gets its own binary allowlist. One agent's approvals don't leak to another.
-- **Channel-targeted prompts** — Approval prompts appear where the agent is working, not in DMs. You approve in context.
-- **Fail-closed** — If you're not around to approve, commands don't run. An unattended agent can't execute arbitrary commands.
+- **Allowlist / denylist gating** — a way to designate which actions run freely, which prompt for approval, and which are hard-blocked. Hard-block must be hard — the model cannot talk past it.
+- **Per-action approval flow** — when an action isn't pre-approved, a prompt with the exact command/tool call + arguments, surfaced in context (not stuffed in a log you'll never read).
+- **Pre-action hooks** — a programmable gate that fires *before* the action runs, with access to the full call shape (tool name, arguments, source), able to allow / block / ask. This is where your behavioral rules become mechanically enforced rather than merely instructed.
+- **Post-action hooks** — runs after the action, for audit logging and injection scanning. Useful precisely because a successful prompt-injection might suppress the model's own self-report.
+- **Fail-closed default** — if you're not around to approve, the action doesn't run. An unattended assistant cannot execute arbitrary actions.
+- **Per-agent isolation** — if you run multiple agents, one agent's allowlist doesn't leak to another.
 
-### The Platform Layer — Claude Code
+Coverage varies by runtime. Some runtimes gate **only shell exec** (the legacy minimum). Others gate **every tool call** — file reads/writes, web fetches, MCP tool calls, agent spawns. Broader coverage is strictly better: an attacker who can't reach a shell can still exfiltrate data through `WebFetch` or write to a hooked file path if those aren't gated.
 
-Claude Code gates tool calls through `~/.claude/settings.json` and through **hooks**. It's a broader surface than exec approvals — it covers *all* tools (file reads/writes, web fetches, MCP tool calls), not just shell commands.
+**Audit your runtime against this list.** If your runtime doesn't have one of these, you've found a place where your behavioral config is the *only* line of defense — and the behavioral layer is exactly what prompt injection targets. Either fix it at the runtime layer, write a wrapper that adds the gate, or shift the action out of the assistant's reach entirely.
 
-**1. Permission rules** — the `permissions` object in `settings.json` holds three arrays:
-- `allow` — tool calls that run without asking (e.g. `"Bash(git status:*)"`, `"Read(~/projects/**)"`)
-- `ask` — tool calls that always prompt, even mid-flow (e.g. `"Bash(git push:*)"`)
-- `deny` — tool calls that are hard-blocked, no prompt (e.g. `"Read(./.env)"`, `"Bash(rm:*)"`)
-
-Rules are matched by tool name and a pattern. `deny` always wins over `allow`.
-
-**2. Permission modes** — the baseline posture for a session:
-- `default` — prompt on anything not already allowed
-- `acceptEdits` — auto-accept file edits, still prompt for commands
-- `plan` — read-only; the assistant can investigate but not act
-- `bypassPermissions` — no gating at all *(treat as off; only for throwaway sandboxes)*
-
-**3. Hooks** — the strongest gate. A `PreToolUse` hook is a shell command that runs *before* every tool call; it inspects the call and can allow, block, or ask. This is the direct analog of OpenClaw's exec approvals — and then some, because it sees every tool, can apply custom logic, and runs regardless of what the model "decided." `PostToolUse` hooks run after, for audit logging and injection scanning.
-
-A mature setup uses hooks for: credential scanning before writes, blocking writes to protected paths, gating cron/agent spawns, pre-flighting external actions, and logging everything. Hooks are where your behavioral rules become *mechanically enforced* instead of merely *instructed*.
-
-> **Cross-platform takeaway:** OpenClaw gates **exec**; Claude Code gates **every tool**. Both are fail-closed when configured right. Whichever you run, the principle is the same — the platform layer must be able to stop an action your behavioral config failed to catch.
+> **Platform examples — OpenClaw and Claude Code.**
+> Full configuration reference at the end of this section. In brief:
+> - **OpenClaw** gates **shell exec only**, with `allow-once` / `allow-always` / `deny` approvals routed to your Discord channel. Fail-closed, per-agent allowlists. Non-exec actions (channel deletes, calendar edits, etc.) aren't covered by the platform layer; the behavioral config is the only gate.
+> - **Claude Code** gates **every tool call** (Bash, Read, Edit, Write, WebFetch, MCP tools, agent spawn) through `permissions` (allow/ask/deny lists) + **hooks** (PreToolUse, PostToolUse) defined in `~/.claude/settings.json`. `deny` is unforgeable; hooks run regardless of what the model decided.
+> - **Other runtimes** — look for the equivalent of permission lists + pre/post hooks. If your runtime offers only "approve every command," that's a partial platform layer; add a wrapper or migrate to a runtime that gates the broader tool surface.
 
 ### What the Behavioral Config Covers That the Platform Can't
 
-The platform layer shows you *what* an action is — `curl -X POST ...`, a write to `~/.ssh/`. It doesn't always tell you *why*, and on OpenClaw it doesn't cover non-exec actions at all.
+The platform layer shows you *what* an action is — `curl -X POST ...`, a write to `~/.ssh/`. It doesn't always tell you *why*, and on runtimes that only gate exec it doesn't cover non-exec actions at all.
 
-Your `AGENTS.md` / `CLAUDE.md` guardrails fill these gaps:
+Your behavioral config fills these gaps:
 
 - **Semantic intent review** — The platform shows `curl -X POST ...`; your tier system asks "why are you sending data outbound?"
 - **Data egress rules** — Detecting whether `curl` is uploading sensitive data vs. fetching a webpage
 - **Protected filesystem paths** — Token-gated access to sensitive directories (iCloud, credential stores)
 - **Credential handling** — Never writing secrets to logs, memory, or messages
 - **Prompt injection defense** — Detecting and quarantining malicious instructions in fetched content
-- **Non-exec actions** — Channel deletes, cron modifications, email sends, and calendar edits. On OpenClaw these aren't shell commands, so exec approvals don't see them — your tier system is the only gate. On Claude Code these are tool calls, so permission rules and hooks *can* see them — but only if you've written rules for them.
+- **Non-exec actions** — Channel deletes, cron modifications, email sends, calendar edits. On exec-only runtimes these aren't gated by the platform at all — your tier system is the only line of defense. On runtimes that gate every tool call, these *can* be covered by platform rules or hooks — but only if you've written rules for them.
 
 ### How the Layers Work Together
 
-| Action Type | Behavioral Layer (`AGENTS.md` / `CLAUDE.md`) | Platform Layer |
+| Action Type | Behavioral Layer | Platform Layer |
 |---|---|---|
-| Read-only / workspace files | Tier 1 — just do it | OpenClaw: no exec involved · Claude Code: `allow` rule |
-| Shell command (trusted binary) | Tier 1 | OpenClaw: auto-approved · Claude Code: `allow` rule |
-| Shell command (new/unknown) | Tier 2 — assistant explains intent | OpenClaw: exec approval prompt · Claude Code: `ask` rule or PreToolUse hook |
-| Destructive exec (force push, terraform, `rm`) | Tier 3 — token flow | OpenClaw: exec approval (double gate) · Claude Code: `deny` rule or hook block |
-| Non-exec action (channel delete, cron, email) | Tier 2 or 3 — your tier rules | OpenClaw: not applicable · Claude Code: permission rule / hook on that tool |
+| Read-only / workspace files | Tier 1 — just do it | Allow rule / not-exec-gated |
+| Shell command (trusted binary) | Tier 1 | Pre-approved (allowlist) |
+| Shell command (new/unknown) | Tier 2 — assistant explains intent | Approval prompt / ask rule / PreToolUse hook |
+| Destructive exec (force push, terraform, `rm`) | Tier 3 — token flow | Hard deny + double-gate (approval *and* deny rule) |
+| Non-exec action (channel delete, cron, email) | Tier 2 or 3 | Per-tool permission rule or hook (if your runtime gates non-exec tools) |
 
 The ideal: even if the assistant hallucinates past a Tier 2 check, the platform layer still catches the action. And even if you've allowed a binary, the assistant's tier system still requires intent disclosure before using it destructively.
 
-### Platform Config Reference — OpenClaw
+### Appendix: Platform Examples
+
+The rest of this section is concrete configuration for OpenClaw and Claude Code. If you're on another runtime, the patterns are the same; the syntax differs. Use these as templates to find / build the equivalent in your runtime's docs.
+
+#### OpenClaw — Platform Config Reference
 
 Set these in `~/.openclaw/openclaw.json` under `"tools"`:
 
@@ -173,7 +165,7 @@ Reply with: /approve abc123 allow-once|allow-always|deny
 
 The allowlist grows organically through your `allow-always` approvals. Start conservative — you'll build up a tailored set of trusted commands quickly.
 
-### Platform Config Reference — Claude Code
+#### Claude Code — Platform Config Reference
 
 Set these in `~/.claude/settings.json`. Permissions are matched most-specific-first; `deny` beats `ask` beats `allow`.
 
@@ -280,7 +272,8 @@ Confirmation must come from [your username/ID].
 **Confirmation channel:** [where you post the token back — typically the originating channel where the action was requested]
 ```
 
-> **Platform-layer tie-in:** Tiers are behavioral — back the high-risk ones with the platform layer too. On OpenClaw, Tier 3 commands should *also* hit an exec approval. On Claude Code, put Tier 2 actions in `permissions.ask` and Tier 3 / destructive actions in `permissions.deny` or behind a `PreToolUse` hook. The tier is what the assistant *should* do; the platform rule is what the system *enforces*.
+> **Platform-layer tie-in:** Tiers are behavioral — back the high-risk ones with the platform layer too. The tier is what the assistant *should* do; the platform rule is what the system *enforces*. Wire Tier 2 actions into your runtime's approval flow; wire Tier 3 / destructive actions into a hard deny or pre-action hook that the model cannot talk past.
+> **Examples:** OpenClaw — Tier 3 commands should *also* hit an exec approval. Claude Code — Tier 2 actions go in `permissions.ask`, Tier 3 actions in `permissions.deny` or behind a `PreToolUse` hook.
 
 ---
 
@@ -323,7 +316,8 @@ What can your assistant read and write?
 - [other paths]
 ```
 
-> **Platform-layer tie-in:** On Claude Code, the off-limits list belongs in `permissions.deny` as `Read(...)` / `Edit(...)` rules — that turns "never access" from an instruction into a hard block. On OpenClaw, enforce protected paths through your token-gate tier plus a `PreToolUse`-equivalent check if available.
+> **Platform-layer tie-in:** Your off-limits paths should be hard-blocked at the platform layer, not just instructed in the behavioral config — "never access" must mechanically mean "cannot access," even if the model is talked into trying. Where your runtime offers tool-call gating, register `Read` / `Edit` / `Write` denies on the protected paths.
+> **Examples:** Claude Code — off-limits paths go in `permissions.deny` as `Read(...)` / `Edit(...)` rules. OpenClaw — exec-only gating doesn't cover non-exec reads/writes, so enforce protected paths through the behavioral tier system plus any pre-action hook your runtime supports.
 
 ---
 
@@ -341,7 +335,7 @@ Identify your most critical config files. Write a dedicated script that:
 3. Polls health post-restart
 4. Automatically restores the backup on failure — without requiring the assistant to be running
 
-Reserve this tier for files where failure is non-interactive and costly. The obvious candidate is the **platform config itself** — `~/.openclaw/openclaw.json` for OpenClaw, `~/.claude/settings.json` for Claude Code — because a bad edit there can break the assistant's ability to fix its own mistake.
+Reserve this tier for files where failure is non-interactive and costly. The obvious candidate is the **platform config itself** — whatever file holds your runtime's permissions, hooks, or allowlist (e.g., `~/.openclaw/openclaw.json` for OpenClaw, `~/.claude/settings.json` for Claude Code, or the equivalent for your runtime) — because a bad edit there can break the assistant's ability to fix its own mistake.
 
 ### Tier B — Dead Man's Switch (everything else)
 
@@ -362,7 +356,7 @@ The key property of Tier B: the revert process is independent of the assistant. 
 ### Decision Points
 
 **Question 1:** Which files need Tier A? (scripted backup + auto-rollback)
-- Platform config (`openclaw.json` / `settings.json`)?
+- Platform config (your runtime's permissions/hooks file — e.g., `openclaw.json`, `settings.json`)?
 - Behavioral config (`AGENTS.md` / `CLAUDE.md`)?
 - Auth configs?
 - Shell init files?
@@ -382,7 +376,7 @@ An existing `.aisnap` means a prior run may have failed without reverting. Treat
 ## Prod File Change Management
 
 ### Tier A — Scripted (automated rollback)
-Files: [e.g., ~/.openclaw/openclaw.json or ~/.claude/settings.json]
+Files: [your runtime's platform config — e.g., ~/.openclaw/openclaw.json, ~/.claude/settings.json, or equivalent]
 Script: [path to rollback script]
 Behavior: backs up → restarts service → health-polls → auto-reverts on failure
 
@@ -451,7 +445,8 @@ Retention: [X days]
 Format: [domain only / full URL]
 ```
 
-> **Platform-layer tie-in:** On Claude Code, gate `WebFetch` and outbound `Bash` (`curl`, `scp`, `rsync`) with `ask`/`deny` rules or a `PreToolUse` hook that scans arguments for credential patterns. On OpenClaw, `curl`/`scp` are exec — route them through approvals and inline-eval gating.
+> **Platform-layer tie-in:** Outbound traffic is one of the highest-risk action classes — gate it with platform rules wherever possible, especially scanning arguments for credential patterns (the model often doesn't realize a token is in the URL it's about to fetch). Cover both the web-fetch tool *and* the shell tools that exfiltrate (`curl`, `scp`, `rsync`, `nc`).
+> **Examples:** Claude Code — gate `WebFetch` and outbound `Bash` patterns with `ask` / `deny` rules or a `PreToolUse` hook that scans arguments. OpenClaw — `curl` / `scp` are exec, so route them through approvals and the inline-eval gate.
 
 ---
 
@@ -517,9 +512,12 @@ A "go" for one push does not authorize the next push in the same session. Each p
 - Show constructed command before running: [yes/no]
 
 ### Platform Enforcement
-Back the denylist with your platform layer so a bypassed tier check still gets caught:
+Back the denylist with your platform layer so a bypassed tier check still gets caught. The principle: the hard-block list belongs in mechanical enforcement (allowlist-default, deny rules, pre-action hooks), not just in behavioral instructions.
+
+**Examples:**
 - **OpenClaw:** configure `tools.exec.security: "allowlist"` and `tools.exec.ask: "on-miss"`. Even if the agent bypasses its own tier check, the exec approval still catches the command.
 - **Claude Code:** put the hard denylist in `permissions.deny` as `Bash(...)` rules, put confirmation-required patterns in `permissions.ask`, and add a `PreToolUse` hook on `Bash` for anything pattern-matching can't express. `deny` beats everything; the model cannot talk its way past it.
+- **Other runtimes:** find the equivalent of "deny these commands no matter what" — usually a pre-tool-call hook or a denylist in the runtime's permission system. If your runtime can't express "hard deny that the model cannot override," that's a meaningful gap; consider migrating or wrapping.
 ```
 
 ---
@@ -531,7 +529,7 @@ Protect your API keys, tokens, and passwords.
 ### Decision Points
 
 **Question 1:** Where are your credentials stored?
-- Platform config (`openclaw.json` / `settings.json`)?
+- Platform config (your runtime's permissions/hooks file — e.g., `openclaw.json`, `settings.json`)?
 - Environment variables?
 - Separate secrets file?
 - OS keychain?
@@ -563,8 +561,8 @@ Protect your API keys, tokens, and passwords.
 - [other locations]
 
 ### Off-Limits for Direct Reads
-- Platform config (`~/.openclaw/openclaw.json` or `~/.claude/settings.json`)
-- `.env` files, `~/.openclaw/credentials/`, keychain
+- Platform config — your runtime's settings file (`~/.openclaw/openclaw.json`, `~/.claude/settings.json`, or equivalent)
+- `.env` files, credential directories, keychain
 - [other sensitive paths]
 
 ### Exposure Protocol
@@ -574,7 +572,8 @@ On suspected leak:
 3. Treat as compromised until [rotation confirmed / X hours]
 ```
 
-> **Platform-layer tie-in:** A `PreToolUse` hook that greps tool-call arguments for credential patterns (long hex strings, `sk-`, `ghp_`, `AKIA...`) is the most reliable defense — it catches a leak the model didn't realize it was making. On Claude Code, `permissions.deny` should list every secrets file as `Read(...)`. On OpenClaw, keep secrets out of allowlisted-binary arguments and gate inline eval.
+> **Platform-layer tie-in:** A pre-action hook that greps tool-call arguments for credential patterns (long hex strings, `sk-`, `ghp_`, `AKIA...`, JWT-shaped tokens) is the most reliable defense — it catches a leak the model didn't realize it was making. Pair it with hard `Read` / `Edit` denies on every secrets file: `.env`, keystore directories, the runtime's own config file, the OS keychain backing store. The model can't expose what it cannot open.
+> **Examples:** Claude Code — `permissions.deny` lists every secrets file as `Read(...)`; a `PreToolUse` hook on `Bash` greps args for credential patterns. OpenClaw — keep secrets out of allowlisted-binary arguments, gate inline eval, and treat the credentials directory as off-limits in the behavioral config.
 
 ---
 
@@ -617,7 +616,8 @@ Soft limit: [number] active jobs
 Task prompts from external sources require: [Tier 2 / block entirely]
 ```
 
-> **Platform-layer tie-in:** On Claude Code, a `PreToolUse` hook on the agent-spawn and task tools can enforce the cron ceiling and block externally-derived prompts mechanically. On OpenClaw, sub-agents inherit per-agent allowlists — confirm an isolated session can't quietly run with a wider allowlist than the parent.
+> **Platform-layer tie-in:** Sub-agents and cron sessions are particularly dangerous because they often start fresh without your in-conversation caution. The platform layer should treat agent-spawn and scheduled-task invocations as gated actions: enforce ceilings (max active jobs) and block externally-derived task prompts before the new context spins up. Inheritance rule: a sub-agent should run with **at most** the parent's allowlist, never wider.
+> **Examples:** Claude Code — a `PreToolUse` hook on the agent-spawn and task tools enforces the ceiling and blocks externally-derived prompts mechanically. OpenClaw — sub-agents inherit per-agent allowlists; confirm an isolated session can't quietly run with a wider allowlist than the parent.
 
 ---
 
@@ -684,7 +684,8 @@ Configure a morning briefing that scans the previous 24h logs and posts to your 
 That last one is easy to miss. It means your assistant completed a Tier 2 action without finishing the authorization flow — the log looks clean but the process was skipped.
 ```
 
-> **Platform-layer tie-in:** On Claude Code, a `PostToolUse` hook is the natural place to write audit entries — it sees every tool call after the fact and can't be skipped by the model. On OpenClaw, drive logging from your behavioral rules and the exec-approval record.
+> **Platform-layer tie-in:** Logging that depends on the model writing audit entries is fragile — a successful prompt injection can suppress self-reporting. Drive your audit log from a post-action hook so it fires regardless of what the model decided. Pair with a tamper-resistant log destination (append-only file, syslog) so an injection that *does* slip past the gates can't quietly cover its tracks.
+> **Examples:** Claude Code — a `PostToolUse` hook is the natural place to write audit entries; it sees every tool call after the fact and can't be skipped by the model. OpenClaw — drive logging from behavioral rules and the exec-approval record, both of which are runtime-side rather than model-discretionary.
 
 ---
 
@@ -724,10 +725,10 @@ System Settings → Privacy & Security
 - [ ] Anywhere — *security risk*
 
 **Directory Permissions**
-Check your assistant's config and workspace directories — `~/.openclaw/` for OpenClaw, `~/.claude/` for Claude Code:
+Check your assistant's config and workspace directories. Examples: `~/.openclaw/` (OpenClaw), `~/.claude/` (Claude Code), or whatever your runtime uses for its config root + working directories:
 ```bash
-ls -la ~/.openclaw/      # or: ls -la ~/.claude/
-ls -la ~/.openclaw/workspace/   # or your Claude Code project/working dirs
+ls -la ~/.<your-runtime-config-dir>/
+ls -la ~/<your-workspace-or-project-dir>/
 ```
 - [ ] Config and workspace dirs are `700` (owner only)
 - [ ] World-readable — *run `chmod 700` on them*
@@ -743,7 +744,7 @@ ls -la ~/.openclaw/workspace/   # or your Claude Code project/working dirs
 
 ## Prompt Injection Defense
 
-This deserves special attention. Your assistant processes content from external sources — any of it could contain attacks. This is platform-independent: OpenClaw and Claude Code are equally exposed, because the vulnerability is in the *content*, not the runtime.
+This deserves special attention. Your assistant processes content from external sources — any of it could contain attacks. This is platform-independent — every agentic runtime is equally exposed, because the vulnerability is in the *content*, not the runtime. Switching runtimes does not solve prompt injection; only constraining what the assistant *can do* after reading malicious content does.
 
 ### Detection Approach
 
@@ -770,7 +771,8 @@ If you do security research, you'll encounter malicious content intentionally. C
 
 Recommend: A keyword (like `sudo`) that only works when verified as coming from you (not from content you're analyzing).
 
-> **Platform-layer tie-in:** Injection defense is mostly behavioral, but a `PostToolUse` hook (Claude Code) scanning fetched content for attack categories gives you a second, model-independent detector — useful precisely because a successful injection might stop the model from reporting itself.
+> **Platform-layer tie-in:** Injection defense is mostly behavioral, but a post-action hook scanning fetched content for attack categories gives you a second, model-independent detector — useful precisely because a successful injection might stop the model from reporting itself. The detector lives outside the model's awareness; it can't be talked out of firing.
+> **Examples:** Claude Code — a `PostToolUse` hook on `WebFetch` and `Read` runs the scanner over fetched content. Other runtimes — wire equivalent detection into whatever post-tool callback your runtime supports, or into an external proxy that sees the same content.
 
 ---
 
@@ -778,7 +780,7 @@ Recommend: A keyword (like `sudo`) that only works when verified as coming from 
 
 Work through these in order:
 
-- [ ] **Platform layer:** Configure `tools.exec` in `openclaw.json` *or* `permissions` + `hooks` in `settings.json` (see "Two-Layer Security Model")
+- [ ] **Platform layer:** Configure your runtime's gating — permissions, allowlists, and pre/post-tool hooks (see "Two-Layer Security Model" for the concept; the appendix has OpenClaw and Claude Code examples)
 - [ ] **Category 1:** Define your three tiers
 - [ ] **Category 2:** Map your filesystem — free, protected, off-limits
 - [ ] **Prod File Change Management:** Identify Tier A files, write rollback script, document Tier B procedure
@@ -808,7 +810,7 @@ Security isn't set-and-forget.
 **Monthly:**
 - Review cron job list — still needed?
 - Check for new credential files that should be protected
-- Update OS and your AI assistant (OpenClaw / Claude Code)
+- Update OS and your AI assistant runtime (whichever you're using)
 
 **Quarterly:**
 - Re-read your behavioral config (`AGENTS.md` / `CLAUDE.md`) — still accurate?
@@ -830,4 +832,4 @@ Security isn't set-and-forget.
 
 ---
 
-*This guide grew out of hands-on hardening sessions with OpenClaw and Claude Code. The concepts apply to any agentic AI assistant — adapt the platform specifics to your runtime, and the rest to your threat model and risk tolerance.*
+*This guide grew out of hands-on hardening sessions on OpenClaw and Claude Code, which are used as concrete examples throughout. The concepts apply to any agentic AI assistant — LangChain, the Anthropic Agent SDK, OpenAI Assistants, custom MCP-host integrations, on-device frameworks, whatever you're running. Adapt the platform specifics to your runtime, and the rest to your threat model and risk tolerance. The threat model is what's shared; the syntax is what's not.*
