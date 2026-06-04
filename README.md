@@ -776,6 +776,98 @@ Recommend: A keyword (like `sudo`) that only works when verified as coming from 
 
 ---
 
+## The SOC Daemon Pattern
+
+Logging is necessary. Logging without triage is a tape recorder no one plays back. Once your audit trail and injection scanner are running, the operational gap is: who's reading the firehose, and when?
+
+The **SOC daemon pattern** answers that by giving your monitoring its own dedicated assistant. A second agent — narrowly scoped, no other responsibilities — subscribes to the audit log, classifies each event, and surfaces only the ones that matter.
+
+### The Problem
+
+Without dedicated triage:
+- You glance at the audit log when something breaks
+- 99% of alerts are false positives or benign-by-context — the signal-to-noise problem strangles every static rule
+- Real incidents drown in mundane chatter
+- Manual review doesn't scale past a single assistant, let alone a fleet
+
+### The Pattern
+
+Run a separate agent — call it `soc-daemon` — whose entire job is reading `~/.claude/audit/*.jsonl` (or your runtime's equivalent audit path) and classifying each entry. Give it a dedicated Discord thread, Slack channel, or chat surface that *only it* posts to. Its taxonomy is small and operational:
+
+| Verdict | Action |
+|---|---|
+| `🟢 false_positive` | Post in-thread, no further action |
+| `🔵 benign` | Post in-thread, no further action |
+| `🔴 ESCALATE` | Post in-thread *and* DM you |
+
+Every alert gets a verdict and a one-line rationale. Real escalations cut through because they're the only thing that ever pages you.
+
+### Topology
+
+```
+   PostToolUse hooks (every assistant)
+                │
+                ▼
+        ~/.claude/audit/*.jsonl
+                │
+                ▼
+            SOC daemon
+                │
+        ┌───────┴───────┐
+        ▼               ▼
+   #soc thread       Your DM
+   (every verdict)   (escalations only)
+```
+
+### Operating Rules
+
+- **Single subscriber.** Only the SOC daemon reads the audit firehose. Other assistants stay out of the thread; cross-talk poisons triage.
+- **DM only on real escalation.** Yellow/blue posts stay in-thread. Red gets pushed to your phone. If you change nothing else, do this — it's what makes the alert volume sustainable.
+- **Signal stacking.** Two yellow rules firing on the same tool call = treat as one logical red. A single yellow is noise; two yellows on the same call is correlation worth a closer look.
+- **Verdict + rationale, always.** "🟢 FP: gog --help service list, on the kill list" is a real triage entry. "🟢" alone is not. The rationale is what makes the audit auditable.
+
+### Gotcha: Scanner Self-Recursion
+
+The SOC daemon's job involves reading the same files the injection scanner watches. If you don't exclude that loop, every alert payload re-fires the moment the daemon reads its own log — an infinite false-positive amplifier.
+
+**Fix:** In the scanner, exclude reads of `~/.claude/audit/` regardless of which tool is doing the read. Both `Read(~/.claude/audit/x.jsonl)` and `Bash(cat ~/.claude/audit/x.jsonl)` need the same exclusion — path-based, not tool-based.
+
+```python
+# In your PostToolUse injection scanner
+AUDIT_ROOT = os.path.expanduser("~/.claude/audit/")
+if tool == "Read":
+    if tool_input.get("file_path", "").startswith(AUDIT_ROOT):
+        sys.exit(0)
+elif tool == "Bash":
+    if AUDIT_ROOT in tool_input.get("command", ""):
+        sys.exit(0)
+```
+
+Path-based audit exclusion accounted for roughly 30% of pre-tuning alert volume in our deployment.
+
+### FP Triage Is Ongoing Work
+
+A scanner is not a fixed asset. The first weeks after deploying one are dominated by tuning false positives:
+- Build an **FP corpus** from your real audit log — pull every hit, classify by source pattern
+- Add **post-match validators** (entropy gates, JSON-path allowlists, surrounding-context allowlists) when a rule fires reliably on legitimate traffic
+- Bench changes against the corpus before shipping — "would this have suppressed the FPs without losing the TPs?"
+- Re-bench periodically as new tools and workflows produce new traffic patterns
+
+The SOC daemon is also a natural feedback loop here: when it classifies the same pattern as a false positive ten times, that's the cue to add a validator and stop generating those alerts at the source.
+
+### When You Need It
+
+- You have more than one or two assistants on the same host and audit volume is past glance-friendly
+- You've shipped a PostToolUse scanner and notice the audit log is full of yellow events you don't read
+- You want a separate eye on your assistant's behavior — same model as having a security team review SOC alerts even when nothing's wrong
+
+If you're running a single assistant for personal use with light traffic, you can probably skip this pattern. The moment you scale past one or two assistants, it pays for itself.
+
+> **Platform-layer tie-in:** The SOC daemon is behavioral — it's an agent reading files. The *platform* responsibility is making sure that agent (a) only ever runs read-only against `~/.claude/audit/`, (b) has the audit-log scanner exclusion configured so it doesn't loop, and (c) is the *only* assistant authorized to DM you from its scoped channel.
+> **Examples:** Claude Code — `permissions.deny` for writes to the audit log, `permissions.allow` for reads of audit log only, and a hook that gates DM-sends from non-SOC daemons. Other runtimes — equivalent allow/deny rules on the SOC daemon's file scope, and a channel-policy lock on who can DM.
+
+---
+
 ## Implementation Checklist
 
 Work through these in order:
@@ -791,6 +883,7 @@ Work through these in order:
 - [ ] **Category 7:** Create log files and set retention policy
 - [ ] **Category 8:** Run OS-level checks and fix any gaps
 - [ ] **Injection Defense:** Implement two-level detection
+- [ ] **SOC Daemon (if running a fleet):** Stand up a dedicated triage agent, configure path-based audit-log exclusion, DM-on-escalate only
 
 After implementation:
 - [ ] Test each tier with a real action
